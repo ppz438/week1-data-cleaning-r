@@ -1,0 +1,471 @@
+---
+title: "Week 1 Task: Data Cleaning and Preliminary Analysis with R"
+subtitle: "Dataset: Titanic Passenger Data (891 passengers, 12 variables)"
+author: "[Your Name] | [Internship / Organisation] | [Date]"
+output:
+  word_document:
+    toc: true
+    toc_depth: 2
+    fig_width: 6.2
+    fig_height: 3.8
+    fig_caption: true
+    highlight: tango
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      comment = "#>", dpi = 150)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(corrplot)
+theme_set(theme_minimal(base_size = 11))
+```
+
+# 1. Objective and Dataset Overview
+
+The objective of this task is to take a raw, publicly available dataset through a complete data cleaning and preliminary analysis workflow in R: inspecting structure, handling missing values, detecting outliers, normalising numeric variables, encoding categorical variables, and carrying out exploratory data analysis (EDA).
+
+## 1.1 Why this dataset?
+
+The Titanic passenger dataset (Data Science Dojo public repository, derived from the Kaggle "Titanic: Machine Learning from Disaster" data) was chosen because it satisfies the brief's requirements for a messy, realistic dataset:
+
+- **Missing values in several columns** at very different severities (`Age` ~20%, `Cabin` ~77%, `Embarked` <1%), which forces different handling strategies rather than one blanket rule.
+- **A mix of numeric and categorical variables** (continuous `Age` and `Fare`, discrete counts, nominal `Sex` and `Embarked`, ordinal `Pclass`, and free text in `Name`).
+- **Skewed numeric data with outliers** (`Fare` has an extreme right tail).
+- **A clear analytical question** (which factors are associated with survival?), so the cleaning decisions can be judged by whether they preserve useful signal.
+
+A known limitation is that the dataset is small (891 rows) and historical, so the findings are descriptive and should not be generalised.
+
+## 1.2 Data dictionary
+
+| Variable | Type | Description |
+|---|---|---|
+| PassengerId | integer | Unique row identifier |
+| Survived | integer (0/1) | Survival outcome (target variable) |
+| Pclass | integer (1/2/3) | Ticket class: a proxy for socio-economic status |
+| Name | text | Passenger name (contains a title such as Mr, Mrs, Miss) |
+| Sex | categorical | male / female |
+| Age | numeric | Age in years |
+| SibSp | integer | Number of siblings or spouses aboard |
+| Parch | integer | Number of parents or children aboard |
+| Ticket | text | Ticket number |
+| Fare | numeric | Passenger fare |
+| Cabin | text | Cabin number |
+| Embarked | categorical | Port of embarkation (C = Cherbourg, Q = Queenstown, S = Southampton) |
+
+## 1.3 Loading the data
+
+```{r load}
+raw <- read.csv("titanic.csv", stringsAsFactors = FALSE, na.strings = c("", "NA"))
+```
+
+Note the `na.strings = c("", "NA")` argument. In this file, missing values are stored as empty strings, which R would otherwise read as a valid (blank) category. Declaring them as `NA` at import time is the first cleaning step.
+
+# 2. Initial Inspection
+
+```{r inspect}
+dim(raw)
+str(raw)
+```
+
+```{r head}
+head(raw, 5)
+```
+
+```{r summary-raw}
+summary(raw)
+```
+
+**Observations from the raw data**
+
+- 891 rows and 12 columns. `Survived`, `Pclass`, `Sex` and `Embarked` are stored as integers or text but are really categorical, so they need type conversion.
+- `Age` has missing values, and `Fare` has a maximum (512.33) far above its median (14.45), which signals a heavy right skew.
+- `Name`, `Ticket` and `Cabin` are free text and cannot be used directly in numeric analysis.
+
+## 2.1 Duplicate check
+
+```{r dupes}
+sum(duplicated(raw))
+sum(duplicated(raw$PassengerId))
+```
+
+There are no duplicate rows and no duplicate passenger IDs, so no records need to be removed.
+
+# 3. Data Cleaning Process
+
+All cleaning is applied to a copy (`df`) so that the raw data remains untouched and the process is reproducible.
+
+## 3.1 Missing value audit
+
+```{r missing-table}
+missing_tbl <- data.frame(
+  variable  = names(raw),
+  n_missing = colSums(is.na(raw)),
+  pct       = round(100 * colMeans(is.na(raw)), 1),
+  row.names = NULL
+) %>% arrange(desc(n_missing))
+missing_tbl
+```
+
+```{r missing-plot, fig.cap="Figure 1: Percentage of missing values by variable (raw data)."}
+missing_tbl %>%
+  filter(n_missing > 0) %>%
+  ggplot(aes(x = reorder(variable, pct), y = pct)) +
+  geom_col(fill = "#2c7fb8") +
+  geom_text(aes(label = paste0(pct, "%")), hjust = -0.1, size = 3.5) +
+  coord_flip() + ylim(0, 90) +
+  labs(x = NULL, y = "% missing")
+```
+
+**Handling strategy.** Each variable gets a method matched to how much is missing and how much it matters:
+
+| Variable | Missing | Decision | Rationale |
+|---|---|---|---|
+| Cabin | 77.1% | Do not impute; create `HasCabin` flag and extract `Deck` | Imputing three quarters of a column would fabricate data. But the *fact* that a cabin was recorded is informative (it is correlated with class). |
+| Age | 19.9% | Impute with the group median by `Title` and `Pclass` | Too much to drop (loses 177 rows) and the overall median would blur real age differences, for example "Master" (boys) versus "Mr". |
+| Embarked | 0.2% (2 rows) | Impute with the mode | Only two values; the mode is a low-risk choice. |
+
+## 3.2 Feature extraction: Title
+
+Titles embedded in `Name` are a strong age proxy, so they are extracted first and used to drive the Age imputation.
+
+```{r title}
+df <- raw
+
+df$Title <- sub("^.*, (.*?)\\..*$", "\\1", df$Name)
+table(df$Title)
+
+# Collapse rare titles into broader groups
+df$Title <- case_when(
+  df$Title %in% c("Mlle", "Ms")                                  ~ "Miss",
+  df$Title %in% c("Mme")                                         ~ "Mrs",
+  df$Title %in% c("Mr", "Mrs", "Miss", "Master")                 ~ df$Title,
+  TRUE                                                           ~ "Rare"
+)
+table(df$Title)
+```
+
+## 3.3 Imputing Age
+
+```{r age-impute}
+age_before <- df$Age   # keep a copy to compare distributions afterwards
+
+overall_median <- median(df$Age, na.rm = TRUE)
+
+df <- df %>%
+  group_by(Title, Pclass) %>%
+  mutate(Age = ifelse(is.na(Age),
+                      median(Age, na.rm = TRUE),
+                      Age)) %>%
+  ungroup()
+
+# Safety net: any group that was entirely NA falls back to the overall median
+df$Age[is.na(df$Age)] <- overall_median
+
+sum(is.na(df$Age))
+```
+
+To check that imputation did not distort the data, the distribution before and after is compared:
+
+```{r age-compare, fig.cap="Figure 2: Age distribution before (observed values only) and after imputation."}
+bind_rows(
+  data.frame(Age = age_before[!is.na(age_before)], stage = "Before (observed only)"),
+  data.frame(Age = df$Age,                          stage = "After imputation")
+) %>%
+  ggplot(aes(Age, fill = stage)) +
+  geom_histogram(binwidth = 4, colour = "white") +
+  facet_wrap(~stage, ncol = 1) +
+  scale_fill_manual(values = c("#2c7fb8", "#7fcdbb"), guide = "none") +
+  labs(y = "Count")
+```
+
+```{r age-stats}
+c(mean_before = mean(age_before, na.rm = TRUE), mean_after = mean(df$Age),
+  sd_before   = sd(age_before,   na.rm = TRUE), sd_after   = sd(df$Age))
+```
+
+The mean is almost unchanged, while the standard deviation shrinks slightly. That is the expected side effect of any median imputation (it adds values at the centre), and it is worth remembering when interpreting variance-based statistics later.
+
+## 3.4 Imputing Embarked and handling Cabin
+
+```{r embarked-cabin}
+# Embarked: mode imputation
+embarked_mode <- names(which.max(table(df$Embarked)))
+embarked_mode
+df$Embarked[is.na(df$Embarked)] <- embarked_mode
+
+# Cabin: convert missingness into information, then drop the raw column
+df$HasCabin <- as.integer(!is.na(df$Cabin))
+df$Deck     <- ifelse(is.na(df$Cabin), "Unknown", substr(df$Cabin, 1, 1))
+df$Cabin    <- NULL
+
+colSums(is.na(df))
+```
+
+No missing values remain.
+
+## 3.5 Type conversion and derived features
+
+```{r types}
+df$Survived <- factor(df$Survived, levels = c(0, 1), labels = c("No", "Yes"))
+df$Pclass   <- factor(df$Pclass, levels = c(1, 2, 3), ordered = TRUE)
+df$Sex      <- factor(df$Sex)
+df$Embarked <- factor(df$Embarked)
+df$Title    <- factor(df$Title)
+df$Deck     <- factor(df$Deck)
+
+# Family size = siblings/spouses + parents/children + the passenger themself
+df$FamilySize <- df$SibSp + df$Parch + 1
+
+str(df)
+```
+
+## 3.6 Outlier detection
+
+Outliers are examined in the continuous variables `Age` and `Fare` using the **IQR rule** (values beyond 1.5 x IQR from the quartiles) and visually with boxplots.
+
+```{r outlier-fn}
+iqr_bounds <- function(x) {
+  q <- quantile(x, c(.25, .75))
+  i <- q[2] - q[1]
+  c(lower = unname(q[1] - 1.5 * i), upper = unname(q[2] + 1.5 * i))
+}
+
+b_age  <- iqr_bounds(df$Age)
+b_fare <- iqr_bounds(df$Fare)
+
+rbind(Age = b_age, Fare = b_fare)
+
+c(age_outliers  = sum(df$Age  < b_age["lower"]  | df$Age  > b_age["upper"]),
+  fare_outliers = sum(df$Fare < b_fare["lower"] | df$Fare > b_fare["upper"]))
+```
+
+```{r outlier-plot, fig.cap="Figure 3: Boxplots of Age and Fare showing IQR-flagged outliers."}
+df %>%
+  select(Age, Fare) %>%
+  pivot_longer(everything(), names_to = "variable", values_to = "value") %>%
+  ggplot(aes(x = variable, y = value)) +
+  geom_boxplot(fill = "#a6cee3", outlier.colour = "#e31a1c") +
+  facet_wrap(~variable, scales = "free") +
+  labs(x = NULL, y = NULL)
+```
+
+**Interpretation and decision.**
+
+- **Age:** the 22 flagged values are all above the upper bound of about 60 years. They are genuine and plausible, so they are **kept**.
+- **Fare:** 116 fares are flagged, and three exceed 500. The high fares are real first-class tickets, so deleting them would remove exactly the passengers who differ most by class. However, the skew would dominate any distance-based or correlation analysis. The better treatment is a **log transform** rather than removal.
+- Fifteen passengers have a fare of exactly 0. These could be crew, staff or data errors; they are flagged but retained since the true cause cannot be verified.
+
+```{r fare-log, fig.cap="Figure 4: Fare distribution before and after a log(1 + x) transformation."}
+df$Fare_log <- log1p(df$Fare)
+
+df %>%
+  select(Fare, Fare_log) %>%
+  pivot_longer(everything(), names_to = "version", values_to = "value") %>%
+  ggplot(aes(value)) +
+  geom_histogram(bins = 30, fill = "#2c7fb8", colour = "white") +
+  facet_wrap(~version, scales = "free") +
+  labs(x = NULL, y = "Count")
+```
+
+```{r skew}
+skewness <- function(x) mean((x - mean(x))^3) / sd(x)^3
+c(skew_Fare = skewness(df$Fare), skew_Fare_log = skewness(df$Fare_log))
+```
+
+The log transform reduces the skewness dramatically, so the outliers no longer dominate the scale.
+
+## 3.7 Normalisation
+
+Two common scalings are applied, so that numeric variables on different scales (Age: 0 to 80, Fare_log: 0 to 6.2) become comparable. This matters for distance-based methods (k-NN, clustering) and for regularised models.
+
+```{r normalise}
+min_max <- function(x) (x - min(x)) / (max(x) - min(x))
+
+df$Age_minmax      <- min_max(df$Age)
+df$Fare_log_minmax <- min_max(df$Fare_log)
+df$Age_z           <- as.numeric(scale(df$Age))
+df$Fare_log_z      <- as.numeric(scale(df$Fare_log))
+
+df %>%
+  select(Age, Age_minmax, Age_z, Fare_log, Fare_log_minmax, Fare_log_z) %>%
+  summary()
+```
+
+Min-max values lie in [0, 1]; z-scores have mean 0 and standard deviation 1. The original columns are kept alongside the scaled ones, because the **raw units are used for interpretation in the EDA** while the scaled versions are reserved for modelling.
+
+## 3.8 Encoding categorical variables
+
+```{r encode}
+# Binary encoding
+df$Sex_male <- as.integer(df$Sex == "male")
+
+# Ordinal encoding (class has a natural order)
+df$Pclass_num <- as.integer(df$Pclass)
+
+# One-hot encoding for nominal variables with no order
+onehot <- model.matrix(~ Embarked + Title - 1, data = df)
+onehot <- as.data.frame(onehot)
+
+df_encoded <- cbind(
+  df %>% select(PassengerId, Survived, Pclass_num, Sex_male, Age_z, Fare_log_z,
+                SibSp, Parch, FamilySize, HasCabin),
+  onehot
+)
+
+dim(df_encoded)
+head(df_encoded, 4)
+```
+
+**Choice of method:** `Sex` is binary, so a single 0/1 column is enough. `Pclass` is ordinal, so integer coding preserves its ranking. `Embarked` and `Title` are nominal, so one-hot encoding avoids implying a false order. (For a regression model, one dummy column per variable would be dropped as a reference category to avoid perfect collinearity.)
+
+## 3.9 Saving the cleaned dataset
+
+```{r save}
+write.csv(df, "titanic_clean.csv", row.names = FALSE)
+write.csv(df_encoded, "titanic_encoded.csv", row.names = FALSE)
+c(clean_rows = nrow(df), clean_cols = ncol(df), missing = sum(is.na(df)))
+```
+
+# 4. Exploratory Data Analysis
+
+## 4.1 Descriptive statistics
+
+```{r desc-num}
+df %>%
+  summarise(across(c(Age, SibSp, Parch, Fare, FamilySize),
+                   list(mean = mean, median = median, sd = sd,
+                        min = min, max = max),
+                   .names = "{.col}__{.fn}")) %>%
+  pivot_longer(everything(), names_to = c("variable", "stat"),
+               names_sep = "__") %>%
+  pivot_wider(names_from = stat, values_from = value) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2)))
+```
+
+```{r desc-cat}
+lapply(df[, c("Survived", "Pclass", "Sex", "Embarked", "Title")],
+       function(x) round(100 * prop.table(table(x)), 1))
+```
+
+About 38% of passengers survived, 55% travelled third class, 65% were male, and 72.5% embarked at Southampton.
+
+## 4.2 Survival by key categorical variables
+
+```{r surv-sex-class, fig.cap="Figure 5: Survival rate by sex and passenger class."}
+df %>%
+  group_by(Sex, Pclass) %>%
+  summarise(rate = mean(Survived == "Yes"), n = n(), .groups = "drop") %>%
+  ggplot(aes(Pclass, rate, fill = Sex)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(label = scales::percent(rate, accuracy = 1)),
+            position = position_dodge(width = 0.9), vjust = -0.4, size = 3.3) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1.05)) +
+  scale_fill_manual(values = c("#e78ac3", "#66c2a5")) +
+  labs(x = "Passenger class", y = "Survival rate")
+```
+
+```{r rates}
+# Survival rate (%) by sex, and by sex within class
+round(100 * tapply(df$Survived == "Yes", df$Sex, mean), 1)
+round(100 * tapply(df$Survived == "Yes", list(df$Sex, df$Pclass), mean), 1)
+```
+
+```{r chisq}
+chisq.test(table(df$Sex, df$Survived))
+```
+
+Sex and survival are strongly associated (p-value far below 0.001). Women survived at 74.2% versus 18.9% for men, and the gap persists within every class (for example 96.8% vs 36.9% in first class, and 50.0% vs 13.5% in third class).
+
+## 4.3 Survival by age
+
+```{r age-survival, fig.cap="Figure 6: Age distribution by survival outcome."}
+ggplot(df, aes(Age, fill = Survived)) +
+  geom_histogram(binwidth = 5, position = "identity", alpha = 0.6, colour = "white") +
+  scale_fill_manual(values = c("#fc8d62", "#66c2a5")) +
+  labs(y = "Count")
+```
+
+```{r age-bands}
+df$AgeBand <- cut(df$Age, breaks = c(0, 10, 20, 30, 40, 50, 60, 100),
+                  right = FALSE)
+tab <- data.frame(
+  age_band = levels(df$AgeBand),
+  n        = as.vector(table(df$AgeBand)),
+  survival_pct = round(100 * tapply(df$Survived == "Yes", df$AgeBand, mean), 1)
+)
+tab
+```
+
+Children under 10 had the highest survival rate (about 61%, n = 66). Survival was lowest for passengers in their 20s (about 28%, n = 312) and for those aged 60 and over (about 27%, n = 26, a small group). Between ages 10 and 60 the rates sit in a fairly narrow 40 to 44% band apart from the dip in the 20s, so age is informative mainly at the extremes and in the 20s.
+
+## 4.4 Fare and family size
+
+```{r fare-class, fig.cap="Figure 7: Fare (log scale) by passenger class."}
+ggplot(df, aes(Pclass, Fare + 1, fill = Pclass)) +
+  geom_boxplot(show.legend = FALSE) +
+  scale_y_log10() +
+  scale_fill_brewer(palette = "Blues") +
+  labs(x = "Passenger class", y = "Fare (log10 scale)")
+```
+
+```{r family, fig.cap="Figure 8: Survival rate by family size."}
+df %>%
+  group_by(FamilySize) %>%
+  summarise(rate = mean(Survived == "Yes"), n = n(), .groups = "drop") %>%
+  ggplot(aes(factor(FamilySize), rate)) +
+  geom_col(fill = "#2c7fb8") +
+  geom_text(aes(label = paste0("n=", n)), vjust = -0.4, size = 3) +
+  scale_y_continuous(labels = scales::percent, limits = c(0, 1)) +
+  labs(x = "Family size (incl. self)", y = "Survival rate")
+```
+
+Passengers travelling alone and those in very large families (5 or more) fared worse than those in small families of 2 to 4. Note the small sample sizes (`n`) at the large-family end, which makes those bars unreliable.
+
+## 4.5 Correlation analysis
+
+```{r corr, fig.cap="Figure 9: Correlation matrix of numeric and encoded variables.", fig.height=4.6}
+num <- df_encoded %>%
+  mutate(Survived = as.integer(Survived == "Yes")) %>%
+  select(Survived, Pclass_num, Sex_male, Age_z, Fare_log_z, SibSp, Parch,
+         FamilySize, HasCabin)
+
+cm <- cor(num)
+round(cm[, "Survived"], 3)
+
+# Pairs referred to in the commentary below
+round(c(Pclass_vs_FareLog   = cm["Pclass_num", "Fare_log_z"],
+        FamilySize_vs_SibSp = cm["FamilySize", "SibSp"],
+        FamilySize_vs_Parch = cm["FamilySize", "Parch"]), 3)
+
+# Is HasCabin just a proxy for first class?
+round(100 * prop.table(table(HasCabin = df$HasCabin, Class = df$Pclass), 2), 1)
+
+corrplot(cm, method = "color", type = "upper", tl.col = "black", tl.cex = 0.8,
+         addCoef.col = "black", number.cex = 0.65, diag = FALSE)
+```
+
+**Key correlations.** Survival is most strongly related to `Sex_male` (strongly negative), then `Pclass_num` (negative: higher class number means lower survival), `Fare_log_z` and `HasCabin` (positive). `Pclass_num` and `Fare_log_z` are also correlated with each other (r = -0.66), so they carry overlapping information and including both in a model introduces some multicollinearity. `FamilySize` is built from `SibSp` and `Parch` (their sum plus one), so it is strongly correlated with both (r = 0.89 and 0.78) and adds little independent information beyond them. `HasCabin` is largely a proxy for first class: 81.5% of first-class passengers have a recorded cabin versus 2.4% in third class.
+
+# 5. Summary of Insights
+
+1. **Sex was the strongest correlate of survival**, followed by passenger class. Women and first-class passengers had far higher survival rates.
+2. **Class and sex interact**: women in third class (50.0%) survived at a higher rate than men in first class (36.9%), so the two effects are not simply additive.
+3. **Age matters mainly at the extremes**: children under 10 had the best odds (about 61%), and passengers in their 20s and those over 60 the worst (about 27 to 28%); ages 10 to 60 outside the 20s are fairly similar.
+4. **Family size has a non-linear effect**: small families did best; solo travellers and very large families did worse.
+5. **Fare is heavily right-skewed and redundant with class**; the log transform is needed for any analysis that assumes roughly symmetric inputs.
+6. **Missingness itself was informative**: whether a cabin was recorded (`HasCabin`) was positively correlated with survival, largely because it proxies for first-class travel.
+
+# 6. Limitations and Next Steps
+
+- **Imputation uncertainty.** Median imputation understates the true variability of `Age`. A more rigorous follow-up would use multiple imputation (for example, the `mice` package) and compare results.
+- **Correlation is not causation.** Correlations here are descriptive. Class, fare, cabin and sex are entangled, and the dataset cannot separate them causally.
+- **Outlier decisions rest on judgement.** Retaining the zero-fare and very-high-fare records was a deliberate choice; a sensitivity analysis excluding them would test whether results change.
+- **Possible next steps:** fit a logistic regression with the encoded features; test interactions between sex and class; evaluate how sensitive conclusions are to the imputation method.
+
+# Appendix: Session Information
+
+```{r session}
+sessionInfo()
+```
